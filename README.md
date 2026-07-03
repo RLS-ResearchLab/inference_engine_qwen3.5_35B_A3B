@@ -33,6 +33,7 @@ bash start.sh --weight-dir ./weights             # start server on :8000
 
 ```
 src/model.py       — model implementation (GDR + GQA + MoE)
+src/model_small.py — ~290M scaled-down variant (random weights, same architecture)
 src/server.py      — OpenAI-compatible chat completions server
 compare_models.py  — logit + generation comparison vs HF reference
 download_weights.py
