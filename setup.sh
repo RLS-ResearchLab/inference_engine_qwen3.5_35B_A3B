@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # One-shot setup for Qwen3.5-35B-A3B inference engine.
-# Creates a clean Python venv at ~/venv to avoid system package conflicts.
-# Run once on a fresh sesterce/H100 machine.
+# Creates a dedicated venv at $SCRIPT_DIR/.venv
+# Requires torch 2.12.1+cu130 on B300 (cu128 grouped_mm crashes on SM10.3)
 #
 # Usage:
 #   bash setup.sh                        # installs deps + downloads weights
@@ -12,7 +12,7 @@ set -euo pipefail
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 WEIGHT_DIR="$SCRIPT_DIR/weights"
 SKIP_WEIGHTS=0
-VENV="${VENV:-$HOME/venv}"
+VENV="${VENV:-$SCRIPT_DIR/.venv}"
 
 while [[ $# -gt 0 ]]; do
     case $1 in
@@ -67,19 +67,7 @@ else
 fi
 
 # Install all other deps
-"$PIP" install -q \
-    safetensors \
-    "transformers>=4.45" \
-    accelerate \
-    fastapi \
-    "uvicorn[standard]" \
-    pydantic \
-    "jinja2>=3.1.0" \
-    huggingface_hub \
-    "lm-eval[api]>=0.4.4" \
-    aiohttp \
-    tabulate \
-    tqdm
+"$PIP" install -q -r "$SCRIPT_DIR/requirements.txt"
 
 echo "  Done."
 echo ""

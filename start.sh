@@ -7,7 +7,7 @@ set -euo pipefail
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 WEIGHT_DIR="${WEIGHT_DIR:-$SCRIPT_DIR/weights}"
 PORT="${PORT:-8000}"
-VENV="${VENV:-$HOME/venv}"
+VENV="${VENV:-$SCRIPT_DIR/.venv}"
 PYTHON="$VENV/bin/python"
 
 while [[ $# -gt 0 ]]; do
