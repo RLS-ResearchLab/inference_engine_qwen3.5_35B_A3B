@@ -216,12 +216,24 @@ class LinearAttn(nn.Module):
 
         # Causal depthwise conv1d
         qkv_t = qkv.transpose(1, 2)                        # [B,8192,T]
-        if conv_state is not None:
-            qkv_t = torch.cat([conv_state, qkv_t], dim=2)
-        qkv_conv = self.conv1d(qkv_t)                      # output length > T
-        new_conv  = qkv_t[:, :, -(CK-1):].detach()
-        offset = conv_state.shape[2] if conv_state is not None else 0
-        qkv_conv = qkv_conv[:, :, offset:offset+T].transpose(1,2)  # [B,T,8192]
+        if conv_state is not None and T == 1:
+            # Single-token decode: use causal_conv1d_update logic.
+            # Prepend state, apply conv with no padding, output is the single result.
+            combined = torch.cat([conv_state, qkv_t], dim=2)  # [B,8192,CK-1+1=CK]
+            new_conv = combined[:, :, -(CK-1):].detach()      # rolling window: drop oldest
+            qkv_conv = F.conv1d(
+                combined, self.conv1d.weight, self.conv1d.bias,
+                padding=0, groups=QKV,
+            )                                                  # [B,8192,1]
+            qkv_conv = qkv_conv.transpose(1, 2)               # [B,1,8192]
+        else:
+            # Prefill (or chunked decode with prior state): standard causal conv with padding.
+            if conv_state is not None:
+                qkv_t = torch.cat([conv_state, qkv_t], dim=2)
+            qkv_conv = self.conv1d(qkv_t)                     # [B,8192, pad+T+pad]
+            new_conv  = qkv_t[:, :, -(CK-1):].detach()
+            offset = conv_state.shape[2] if conv_state is not None else 0
+            qkv_conv = qkv_conv[:, :, offset:offset+T].transpose(1, 2)  # [B,T,8192]
         qkv_conv = F.silu(qkv_conv)
 
         # Split Q, K, V (key_dim=LKH*LHD=2048, value_dim=LVH*LHD=4096)
@@ -248,7 +260,12 @@ class LinearAttn(nn.Module):
         q = l2norm(q.float()) * scale       # [B,T,32,128]
         k = l2norm(k.float())               # [B,T,32,128]
 
-        # GDR sequential scan
+        # GDR sequential scan — matches HF torch_recurrent_gated_delta_rule exactly:
+        #   S = S * g_t                          (decay first)
+        #   kv_mem = (S * k_t).sum(dim=-2)       (k_t @ decayed S)
+        #   delta = (v_t - kv_mem) * beta_t      (beta on residual)
+        #   S = S + k_t[:,:,None] * delta[:,None] (rank-1 update)
+        #   y_t = (S * q_t).sum(dim=-2)
         if state is None:
             S = torch.zeros(B, LVH, LHD, LHD, device=x.device, dtype=torch.float32)
         else:
@@ -256,28 +273,26 @@ class LinearAttn(nn.Module):
 
         ys = []
         for t in range(T):
-            g_t    = g[:, t, :]        # [B, 32]
-            beta_t = beta[:, t, :]     # [B, 32]
-            k_t    = k[:, t, :, :]     # [B, 32, 128]
-            v_t    = v[:, t, :, :].float()  # [B, 32, 128]
-            q_t    = q[:, t, :, :]     # [B, 32, 128]
+            g_t    = g[:, t, :].exp().unsqueeze(-1).unsqueeze(-1)  # [B,32,1,1]
+            beta_t = beta[:, t, :].unsqueeze(-1)                   # [B,32,1]
+            k_t    = k[:, t, :, :].float()   # [B,32,128]
+            v_t    = v[:, t, :, :].float()   # [B,32,128]
+            q_t    = q[:, t, :, :].float()   # [B,32,128]
 
-            decay  = g_t.exp()          # [B, 32]  (g_t is negative, so decay in (0,1))
+            # Decay state first
+            S = S * g_t                                             # [B,32,128,128]
 
-            # Weighted K: k_beta = beta_t * k_t
-            k_beta = beta_t.unsqueeze(-1) * k_t      # [B, 32, 128]
+            # Memory retrieval from decayed state
+            kv_mem = (S * k_t.unsqueeze(-1)).sum(dim=-2)           # [B,32,128]
 
-            # Delta rule: v_prime = k_beta @ S  (projection of state onto k)
-            v_prime = torch.einsum('bhi,bhij->bhj', k_beta, S)   # [B,32,128]
+            # Delta: (v - k@S) * beta
+            delta = (v_t - kv_mem) * beta_t                        # [B,32,128]
 
-            # Update: k^T @ (v - v_prime)  is a rank-1 outer product correction
-            delta = v_t - v_prime                                 # [B,32,128]
-            outer = torch.einsum('bhi,bhj->bhij', k_beta, delta) # [B,32,128,128]
-
-            S = decay[:, :, None, None] * S + outer
+            # Rank-1 update
+            S = S + k_t.unsqueeze(-1) * delta.unsqueeze(-2)        # [B,32,128,128]
 
             # Output
-            y_t = torch.einsum('bhi,bhij->bhj', q_t, S)         # [B,32,128]
+            y_t = (S * q_t.unsqueeze(-1)).sum(dim=-2)              # [B,32,128]
             ys.append(y_t)
 
         new_state = S.detach()
@@ -416,7 +431,6 @@ class Qwen35MoE(nn.Module):
         Ttot  = T + past
         self._ensure_rope(Ttot, dev)
 
-        # Causal mask [1,1,T,Ttot]
         mask = torch.full((T, Ttot), float('-inf'), device=dev, dtype=x.dtype)
         for i in range(T): mask[i, :past+i+1] = 0.0
         mask = mask[None, None]
@@ -432,53 +446,102 @@ class Qwen35MoE(nn.Module):
         return logits, nkvs, nss, ncs
 
 # ── Weight Loading ────────────────────────────────────────────────────────────
-def load_weights(model, weight_dir, verbose=True):
+def _build_translate():
+    """Return a function that maps HF weight keys to our model keys."""
+    table = {
+        'input_layernorm.weight':          'input_layernorm.weight',
+        'post_attention_layernorm.weight': 'post_attention_layernorm.weight',
+        'self_attn.q_proj.weight':  'self_attn.q_proj.weight',
+        'self_attn.k_proj.weight':  'self_attn.k_proj.weight',
+        'self_attn.v_proj.weight':  'self_attn.v_proj.weight',
+        'self_attn.o_proj.weight':  'self_attn.o_proj.weight',
+        'self_attn.q_norm.weight':  'self_attn.q_norm.weight',
+        'self_attn.k_norm.weight':  'self_attn.k_norm.weight',
+        'linear_attn.in_proj_qkv.weight': 'linear_attn.in_proj_qkv.weight',
+        'linear_attn.in_proj_z.weight':   'linear_attn.in_proj_z.weight',
+        'linear_attn.in_proj_a.weight':   'linear_attn.in_proj_a.weight',
+        'linear_attn.in_proj_b.weight':   'linear_attn.in_proj_b.weight',
+        'linear_attn.conv1d.weight':       'linear_attn.conv1d.weight',
+        'linear_attn.A_log':               'linear_attn.A_log',
+        'linear_attn.dt_bias':             'linear_attn.dt_bias',
+        'linear_attn.norm.weight':         'linear_attn.norm.weight',
+        'linear_attn.out_proj.weight':     'linear_attn.out_proj.weight',
+        'mlp.gate.weight':                    'mlp.gate.weight',
+        'mlp.shared_expert.gate_proj.weight': 'mlp.shared_gate_proj.weight',
+        'mlp.shared_expert.up_proj.weight':   'mlp.shared_up_proj.weight',
+        'mlp.shared_expert.down_proj.weight': 'mlp.shared_down_proj.weight',
+        'mlp.shared_expert_gate.weight':      'mlp.shared_expert_gate.weight',
+        'mlp.experts.gate_up_proj':           'mlp.experts_gate_up',
+        'mlp.experts.down_proj':              'mlp.experts_down',
+    }
+    def translate(hk):
+        if hk.startswith('model.visual.') or hk.startswith('mtp.'): return None
+        k = hk
+        if k.startswith('model.language_model.'): k = k[len('model.language_model.'):]
+        if k == 'lm_head.weight':      return 'lm_head.weight'
+        if k == 'embed_tokens.weight': return 'embed_tokens.weight'
+        if k == 'norm.weight':         return 'norm.weight'
+        m = re.match(r'layers\.(\d+)\.(.*)', k)
+        if not m: return None
+        li, rest = m.group(1), m.group(2)
+        if rest in table: return f'layers.{li}.{table[rest]}'
+        return None
+    return translate
+
+
+def load_weights(model, weight_dir, verbose=True, device_map=None):
+    """Load HF safetensors weights into model.
+
+    device_map: optional dict mapping model param names to devices.
+                When provided, each tensor is placed directly on its target
+                device instead of going through a full CPU state_dict.
+    """
     with open(os.path.join(weight_dir, 'model.safetensors.index.json')) as f:
         wmap = json.load(f)['weight_map']
 
     shards = {}
     for k, v in wmap.items(): shards.setdefault(v, []).append(k)
 
-    def translate(hk):
-        if hk.startswith('model.visual.') or hk.startswith('mtp.'): return None
-        k = hk
-        if k.startswith('model.language_model.'): k = k[len('model.language_model.'):]
-        if k == 'lm_head.weight':          return 'lm_head.weight'
-        if k == 'embed_tokens.weight':     return 'embed_tokens.weight'
-        if k == 'norm.weight':             return 'norm.weight'
-        m = re.match(r'layers\.(\d+)\.(.*)', k)
-        if not m: return None
-        li, rest = m.group(1), m.group(2)
-        p = f'layers.{li}.'
-        table = {
-            'input_layernorm.weight':          'input_layernorm.weight',
-            'post_attention_layernorm.weight': 'post_attention_layernorm.weight',
-            'self_attn.q_proj.weight':  'self_attn.q_proj.weight',
-            'self_attn.k_proj.weight':  'self_attn.k_proj.weight',
-            'self_attn.v_proj.weight':  'self_attn.v_proj.weight',
-            'self_attn.o_proj.weight':  'self_attn.o_proj.weight',
-            'self_attn.q_norm.weight':  'self_attn.q_norm.weight',
-            'self_attn.k_norm.weight':  'self_attn.k_norm.weight',
-            'linear_attn.in_proj_qkv.weight': 'linear_attn.in_proj_qkv.weight',
-            'linear_attn.in_proj_z.weight':   'linear_attn.in_proj_z.weight',
-            'linear_attn.in_proj_a.weight':   'linear_attn.in_proj_a.weight',
-            'linear_attn.in_proj_b.weight':   'linear_attn.in_proj_b.weight',
-            'linear_attn.conv1d.weight':       'linear_attn.conv1d.weight',
-            'linear_attn.A_log':               'linear_attn.A_log',
-            'linear_attn.dt_bias':             'linear_attn.dt_bias',
-            'linear_attn.norm.weight':         'linear_attn.norm.weight',
-            'linear_attn.out_proj.weight':     'linear_attn.out_proj.weight',
-            'mlp.gate.weight':                    'mlp.gate.weight',
-            'mlp.shared_expert.gate_proj.weight': 'mlp.shared_gate_proj.weight',
-            'mlp.shared_expert.up_proj.weight':   'mlp.shared_up_proj.weight',
-            'mlp.shared_expert.down_proj.weight': 'mlp.shared_down_proj.weight',
-            'mlp.shared_expert_gate.weight':      'mlp.shared_expert_gate.weight',
-            'mlp.experts.gate_up_proj':           'mlp.experts_gate_up',
-            'mlp.experts.down_proj':              'mlp.experts_down',
-        }
-        if rest in table: return p + table[rest]
-        return None
+    translate = _build_translate()
 
+    if device_map is not None:
+        # Direct-to-device loading: set each parameter in-place on its target device.
+        # Avoids holding the full model in CPU RAM when using multi-GPU dispatch.
+        param_dict = dict(model.named_parameters())
+        param_dict.update(dict(model.named_buffers()))
+        mapped = 0
+        mismatches = []
+        for shard_name in sorted(shards):
+            if verbose: print(f'  {shard_name}', flush=True)
+            f = safe_open(os.path.join(weight_dir, shard_name), framework='pt', device='cpu')
+            for hk in shards[shard_name]:
+                mk = translate(hk)
+                if mk is None: continue
+                if mk not in param_dict:
+                    mismatches.append(f'model key missing: {mk}')
+                    continue
+                t = f.get_tensor(hk).to(param_dict[mk].dtype)
+                if t.shape != param_dict[mk].shape:
+                    mismatches.append(f'shape {hk}: hf={t.shape} model={param_dict[mk].shape}')
+                    continue
+                # Find target device from device_map (look up by layer/module prefix)
+                target_dev = None
+                for prefix in sorted(device_map.keys(), key=len, reverse=True):
+                    if mk == prefix or mk.startswith(prefix + '.') or prefix == '':
+                        target_dev = device_map[prefix]
+                        break
+                if target_dev is None:
+                    target_dev = 'cpu'
+                with torch.no_grad():
+                    param_dict[mk].data = t.to(target_dev)
+                mapped += 1
+        if mismatches:
+            print(f'  Issues ({len(mismatches)}):')
+            for m in mismatches[:10]: print(f'    {m}')
+        if verbose: print(f'  Mapped {mapped} tensors.')
+        return model
+
+    # Default: load everything to CPU via state_dict
     sd = model.state_dict()
     mapped = 0
     mismatches = []

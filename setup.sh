@@ -1,5 +1,6 @@
 #!/usr/bin/env bash
 # One-shot setup for Qwen3.5-35B-A3B inference engine.
+# Creates a clean Python venv at ~/venv to avoid system package conflicts.
 # Run once on a fresh sesterce/H100 machine.
 #
 # Usage:
@@ -11,6 +12,7 @@ set -euo pipefail
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 WEIGHT_DIR="$SCRIPT_DIR/weights"
 SKIP_WEIGHTS=0
+VENV="${VENV:-$HOME/venv}"
 
 while [[ $# -gt 0 ]]; do
     case $1 in
@@ -25,10 +27,19 @@ echo " Qwen3.5-35B-A3B Inference Engine — Setup"
 echo "================================================================"
 echo "  Script dir : $SCRIPT_DIR"
 echo "  Weight dir : $WEIGHT_DIR"
+echo "  Venv       : $VENV"
 echo ""
 
-# ── 1. Python deps ────────────────────────────────────────────────────────────
-echo "[1/3] Installing Python dependencies..."
+# ── 1. Python venv + deps ─────────────────────────────────────────────────────
+echo "[1/3] Setting up Python venv and dependencies..."
+
+# Create venv if it doesn't exist
+if [[ ! -f "$VENV/bin/python" ]]; then
+    echo "  Creating venv at $VENV..."
+    python3 -m venv "$VENV"
+fi
+PY="$VENV/bin/python"
+PIP="$VENV/bin/pip"
 
 # Detect CUDA version to pick the right PyTorch build
 CUDA_VER=$(nvcc --version 2>/dev/null | grep -oP 'release \K[0-9]+\.[0-9]+' || echo "12.4")
@@ -42,19 +53,19 @@ elif [[ "$CUDA_MAJOR" -eq 12 ]]; then WHL_IDX="cu124"
 else WHL_IDX="cu121"
 fi
 
-echo "  Detected CUDA $CUDA_VER → using torch wheel index: $WHL_IDX"
+echo "  Detected CUDA $CUDA_VER → torch wheel: $WHL_IDX"
 
-# Install torch first (skip if already correct CUDA version)
-TORCH_CUDA=$(python3 -c "import torch; print(torch.version.cuda or '')" 2>/dev/null || echo "")
-if [[ -z "$TORCH_CUDA" ]]; then
-    echo "  Installing PyTorch..."
-    pip install -q torch --index-url "https://download.pytorch.org/whl/${WHL_IDX}"
+# Install torch in venv
+TORCH_OK=$("$PY" -c "import torch; print(torch.cuda.is_available())" 2>/dev/null || echo "False")
+if [[ "$TORCH_OK" != "True" ]]; then
+    echo "  Installing PyTorch ($WHL_IDX)..."
+    "$PIP" install -q torch --index-url "https://download.pytorch.org/whl/${WHL_IDX}"
 else
-    echo "  PyTorch already installed (CUDA $TORCH_CUDA)"
+    echo "  PyTorch already installed in venv"
 fi
 
-# Install remaining deps
-pip install -q \
+# Install all other deps
+"$PIP" install -q \
     safetensors \
     "transformers>=4.45" \
     accelerate \
@@ -66,15 +77,14 @@ pip install -q \
     "lm-eval[api]>=0.4.4" \
     aiohttp \
     tabulate \
-    tqdm \
-    numpy
+    tqdm
 
 echo "  Done."
 echo ""
 
 # ── 2. Verify CUDA is accessible ─────────────────────────────────────────────
 echo "[2/3] Verifying CUDA..."
-python3 -c "
+"$PY" -c "
 import torch
 assert torch.cuda.is_available(), 'CUDA not available!'
 n = torch.cuda.device_count()
@@ -91,7 +101,7 @@ if [[ "$SKIP_WEIGHTS" -eq 1 ]]; then
 else
     echo "[3/3] Downloading Qwen/Qwen3.5-35B-A3B weights (~67 GB)..."
     echo "  Destination: $WEIGHT_DIR"
-    python3 "$SCRIPT_DIR/download_weights.py" --dest "$WEIGHT_DIR"
+    "$PY" "$SCRIPT_DIR/download_weights.py" --dest "$WEIGHT_DIR"
 fi
 
 echo ""

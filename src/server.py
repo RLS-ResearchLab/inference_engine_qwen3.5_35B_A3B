@@ -55,17 +55,17 @@ class Engine:
     passes so VRAM is never double-booked. Threads yield the mutex between
     every token, so requests at the same concurrency level take turns.
     """
-    def __init__(self, model, tokenizer, device):
-        self.model   = model
-        self.tok     = tokenizer
-        self.device  = device
-        self.eos_id  = tokenizer.eos_token_id
-        self._gpu_lock = threading.Lock()   # serialises GPU forward passes
+    def __init__(self, model, tokenizer, first_device: str = "cuda:0"):
+        self.model       = model
+        self.tok         = tokenizer
+        self.first_device = first_device
+        self.eos_id      = tokenizer.eos_token_id
+        self._gpu_lock   = threading.Lock()   # serialises GPU forward passes
 
     def generate(self, input_ids: torch.Tensor, max_tokens: int,
                  temperature: float, top_p: float) -> list[int]:
         """Run full generation for one request. Blocks caller thread."""
-        ids = input_ids.to(self.device)
+        ids = input_ids.to(self.first_device)
         kvs = states = convs = None
         output_ids: list[int] = []
 
@@ -78,7 +78,7 @@ class Engine:
 
         # Decode
         while next_id != self.eos_id and len(output_ids) < max_tokens:
-            tok_tensor = torch.tensor([[next_id]], device=self.device)
+            tok_tensor = torch.tensor([[next_id]], device=self.first_device)
             with self._gpu_lock:
                 with torch.no_grad():
                     logits, kvs, states, convs = self.model(
@@ -176,7 +176,6 @@ def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--weight-dir", default=str(Path(__file__).parent.parent / "weights"),
                         help="Path to safetensors weights dir")
-    parser.add_argument("--device",     default="cuda:0")
     parser.add_argument("--port",       type=int, default=8000)
     parser.add_argument("--host",       default="0.0.0.0")
     args = parser.parse_args()
@@ -184,18 +183,16 @@ def main():
     print(f"Loading tokenizer from {args.weight_dir}...")
     _tok = AutoTokenizer.from_pretrained(args.weight_dir, trust_remote_code=True)
 
-    print(f"Building model...")
+    print("Building model...")
     model = Qwen35MoE().to(torch.bfloat16)
     print(f"  Parameters: {sum(p.numel() for p in model.parameters())/1e9:.2f}B")
-
-    print(f"Loading weights...")
+    print("Loading weights...")
     load_weights(model, args.weight_dir, verbose=False)
-
-    print(f"Moving to {args.device}...")
-    model = model.to(args.device).eval()
+    print("Moving to cuda:0...")
+    model = model.to("cuda:0").eval()
 
     print("Starting engine...")
-    _engine = Engine(model, _tok, args.device)
+    _engine = Engine(model, _tok, "cuda:0")
 
     print(f"Server ready on {args.host}:{args.port}")
     uvicorn.run(app, host=args.host, port=args.port, log_level="warning")
