@@ -14,6 +14,10 @@ import random
 import sys
 import subprocess
 
+# Ensure our own output is unbuffered when piped through SSH
+os.environ.setdefault("PYTHONUNBUFFERED", "1")
+sys.stdout.reconfigure(line_buffering=True)
+
 
 TASK = "gsm8k_cot"
 LIMIT = 200
@@ -31,7 +35,7 @@ def run_eval(base_url: str, output_dir: str, num_concurrent: int, limit: int, se
     )
 
     cmd = [
-        sys.executable, "-m", "lm_eval",
+        sys.executable, "-u", "-m", "lm_eval",
         "--model", "local-chat-completions",
         "--model_args", model_args,
         "--tasks", TASK,
@@ -43,8 +47,10 @@ def run_eval(base_url: str, output_dir: str, num_concurrent: int, limit: int, se
         "--log_samples",
     ]
 
-    print(f"Running: {' '.join(cmd)}\n")
-    result = subprocess.run(cmd, capture_output=False)
+    print(f"Running: {' '.join(cmd)}\n", flush=True)
+    env = os.environ.copy()
+    env["PYTHONUNBUFFERED"] = "1"
+    result = subprocess.run(cmd, capture_output=False, env=env)
 
     if result.returncode != 0:
         print(f"\nlm-eval exited with code {result.returncode}")
