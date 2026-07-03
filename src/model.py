@@ -257,27 +257,33 @@ class LinearAttn(nn.Module):
 
         # L2-normalize Q and K (use_qk_l2norm_in_kernel=True)
         scale = LHD ** -0.5
-        q = l2norm(q.float()) * scale       # [B,T,32,128]
-        k = l2norm(k.float())               # [B,T,32,128]
+        q = l2norm(q) * scale               # [B,T,32,128] in x.dtype
+        k = l2norm(k)                        # [B,T,32,128] in x.dtype
 
-        # GDR sequential scan — matches HF torch_recurrent_gated_delta_rule exactly:
+        # GDR sequential scan in bf16 — matches HF torch_recurrent_gated_delta_rule:
         #   S = S * g_t                          (decay first)
         #   kv_mem = (S * k_t).sum(dim=-2)       (k_t @ decayed S)
         #   delta = (v_t - kv_mem) * beta_t      (beta on residual)
         #   S = S + k_t[:,:,None] * delta[:,None] (rank-1 update)
         #   y_t = (S * q_t).sum(dim=-2)
+        dt = x.dtype
         if state is None:
-            S = torch.zeros(B, LVH, LHD, LHD, device=x.device, dtype=torch.float32)
+            S = torch.zeros(B, LVH, LHD, LHD, device=x.device, dtype=dt)
         else:
-            S = state.float()
+            S = state.to(dt)
+
+        # Cast scan inputs to model dtype
+        g    = g.to(dt)
+        beta = beta.to(dt)
+        v    = v.to(dt)
 
         ys = []
         for t in range(T):
             g_t    = g[:, t, :].exp().unsqueeze(-1).unsqueeze(-1)  # [B,32,1,1]
             beta_t = beta[:, t, :].unsqueeze(-1)                   # [B,32,1]
-            k_t    = k[:, t, :, :].float()   # [B,32,128]
-            v_t    = v[:, t, :, :].float()   # [B,32,128]
-            q_t    = q[:, t, :, :].float()   # [B,32,128]
+            k_t    = k[:, t, :, :]          # [B,32,128]
+            v_t    = v[:, t, :, :]          # [B,32,128]
+            q_t    = q[:, t, :, :]          # [B,32,128]
 
             # Decay state first
             S = S * g_t                                             # [B,32,128,128]
@@ -301,7 +307,7 @@ class LinearAttn(nn.Module):
         y = y.reshape(B*T*LVH, LHD)    # flatten for norm: [B*T*32, 128]
         z_flat = z.reshape(B*T*LVH, LHD)
         y = self.norm(y, z_flat)        # RMSNormGated: norm(y) * silu(z), returns x.dtype
-        y = y.to(x.dtype).reshape(B, T, LVH * LHD)
+        y = y.reshape(B, T, LVH * LHD)
 
         return self.out_proj(y), new_state, new_conv
 
