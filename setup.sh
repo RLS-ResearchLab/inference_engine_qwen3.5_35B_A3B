@@ -47,7 +47,9 @@ CUDA_MAJOR=$(echo "$CUDA_VER" | cut -d. -f1)
 CUDA_MINOR=$(echo "$CUDA_VER" | cut -d. -f2)
 
 # Map to PyTorch wheel index
-if   [[ "$CUDA_MAJOR" -ge 13 ]]; then WHL_IDX="cu128"
+# CUDA 13 (driver 580+, B300/SM103): use cu130 wheels — cu128 grouped_mm
+# crashes on SM10.3 (CUTLASS error 7), cu130 fixes it.
+if   [[ "$CUDA_MAJOR" -ge 13 ]]; then WHL_IDX="cu130"
 elif [[ "$CUDA_MAJOR" -eq 12 && "$CUDA_MINOR" -ge 6 ]]; then WHL_IDX="cu126"
 elif [[ "$CUDA_MAJOR" -eq 12 ]]; then WHL_IDX="cu124"
 else WHL_IDX="cu121"
