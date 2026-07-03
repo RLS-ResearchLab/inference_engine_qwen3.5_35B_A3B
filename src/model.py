@@ -8,7 +8,7 @@ Architecture:
   full_attn:   GQA with partial RoPE and output gate
   FFN: MoE (256 experts, top-8) + shared expert (sigmoid gate)
 """
-import math, json, os, re
+import math, json, os
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -312,16 +312,33 @@ class LinearAttn(nn.Module):
         return self.out_proj(y), new_state, new_conv
 
 # ── MoE FFN ──────────────────────────────────────────────────────────────────
+class SharedExpert(nn.Module):
+    """Matches HF mlp.shared_expert.{gate_proj,up_proj,down_proj}."""
+    def __init__(self):
+        super().__init__()
+        self.gate_proj = nn.Linear(H, SI, bias=False)
+        self.up_proj   = nn.Linear(H, SI, bias=False)
+        self.down_proj = nn.Linear(SI, H, bias=False)
+
+    def forward(self, x):
+        return self.down_proj(F.silu(self.gate_proj(x)) * self.up_proj(x))
+
+
+class Experts(nn.Module):
+    """Matches HF mlp.experts.{gate_up_proj,down_proj}."""
+    def __init__(self):
+        super().__init__()
+        self.gate_up_proj = nn.Parameter(torch.empty(NE, 2*MI, H))  # [256,1024,2048]
+        self.down_proj    = nn.Parameter(torch.empty(NE, H,    MI))  # [256,2048, 512]
+
+
 class MoEFFN(nn.Module):
     def __init__(self):
         super().__init__()
-        self.experts_gate_up = nn.Parameter(torch.empty(NE, 2*MI, H))  # [256,1024,2048]
-        self.experts_down    = nn.Parameter(torch.empty(NE, H,    MI))  # [256,2048, 512]
+        self.experts         = Experts()
         self.gate            = nn.Linear(H, NE, bias=False)
-        self.shared_gate_proj   = nn.Linear(H, SI, bias=False)
-        self.shared_up_proj     = nn.Linear(H, SI, bias=False)
-        self.shared_down_proj   = nn.Linear(SI, H, bias=False)
-        self.shared_expert_gate = nn.Linear(H, 1,  bias=False)
+        self.shared_expert   = SharedExpert()
+        self.shared_expert_gate = nn.Linear(H, 1, bias=False)
 
     def forward(self, x):
         B, T, _ = x.shape
@@ -331,50 +348,37 @@ class MoEFFN(nn.Module):
         w, idx = torch.topk(self.gate(xf), TK, -1)   # [N, TK]
         w = F.softmax(w, -1).to(x.dtype)              # [N, TK]
 
-        out = torch.zeros_like(xf)
-
-        # Vectorized expert dispatch: group tokens by expert, run each expert once.
-        # idx: [N, TK] — for each token, TK expert indices
-        # Flatten to [N*TK] assignments, gather tokens, scatter results.
         flat_idx = idx.reshape(-1)          # [N*TK]
         flat_w   = w.reshape(-1)            # [N*TK]
-        # Repeat token rows TK times to pair with each expert assignment
-        token_rep = xf.unsqueeze(1).expand(N, TK, H).reshape(N * TK, H)  # [N*TK, H]
+        token_rep = xf.unsqueeze(1).expand(N, TK, H).reshape(N * TK, H)
 
-        # Sort by expert id so we can slice contiguous chunks
-        sort_order = torch.argsort(flat_idx, stable=True)
-        sorted_idx     = flat_idx[sort_order]       # [N*TK] sorted expert ids
-        sorted_tokens  = token_rep[sort_order]      # [N*TK, H]
-        sorted_weights = flat_w[sort_order]         # [N*TK]
+        sort_order     = torch.argsort(flat_idx, stable=True)
+        sorted_idx     = flat_idx[sort_order]
+        sorted_tokens  = token_rep[sort_order]
+        sorted_weights = flat_w[sort_order]
 
-        # Compute expert boundaries
-        expert_counts = torch.bincount(sorted_idx, minlength=NE)  # [NE]
+        expert_counts  = torch.bincount(sorted_idx, minlength=NE)
         expert_offsets = torch.cat([torch.zeros(1, device=x.device, dtype=torch.long),
                                     expert_counts.cumsum(0)[:-1]])
 
         sorted_out = torch.zeros(N * TK, H, device=x.device, dtype=x.dtype)
 
-        # Run each expert only on its assigned tokens
         for e in range(NE):
             cnt = expert_counts[e].item()
             if cnt == 0:
                 continue
             start = expert_offsets[e].item()
-            xt = sorted_tokens[start:start+cnt]               # [cnt, H]
-            gw, uw = self.experts_gate_up[e].chunk(2, 0)     # each [MI, H]
-            h = F.silu(xt @ gw.t()) * (xt @ uw.t())          # [cnt, MI]
-            h = h @ self.experts_down[e].t()                  # [cnt, H]
+            xt = sorted_tokens[start:start+cnt]
+            gw, uw = self.experts.gate_up_proj[e].chunk(2, 0)
+            h = F.silu(xt @ gw.t()) * (xt @ uw.t())
+            h = h @ self.experts.down_proj[e].t()
             sorted_out[start:start+cnt] = sorted_weights[start:start+cnt].unsqueeze(-1) * h
 
-        # Scatter back: unsort, then sum contributions per token
         unsort_order = torch.argsort(sort_order, stable=True)
-        token_out = sorted_out[unsort_order].reshape(N, TK, H).sum(dim=1)  # [N, H]
-        out = token_out
+        out = sorted_out[unsort_order].reshape(N, TK, H).sum(dim=1)
 
-        # Shared expert
         sg = torch.sigmoid(self.shared_expert_gate(xf))
-        sh = F.silu(self.shared_gate_proj(xf)) * self.shared_up_proj(xf)
-        out = out + sg * self.shared_down_proj(sh)
+        out = out + sg * self.shared_expert(xf)
         return out.view(B, T, H)
 
 # ── Decoder Layer ─────────────────────────────────────────────────────────────
@@ -452,124 +456,60 @@ class Qwen35MoE(nn.Module):
         return logits, nkvs, nss, ncs
 
 # ── Weight Loading ────────────────────────────────────────────────────────────
-def _build_translate():
-    """Return a function that maps HF weight keys to our model keys."""
-    table = {
-        'input_layernorm.weight':          'input_layernorm.weight',
-        'post_attention_layernorm.weight': 'post_attention_layernorm.weight',
-        'self_attn.q_proj.weight':  'self_attn.q_proj.weight',
-        'self_attn.k_proj.weight':  'self_attn.k_proj.weight',
-        'self_attn.v_proj.weight':  'self_attn.v_proj.weight',
-        'self_attn.o_proj.weight':  'self_attn.o_proj.weight',
-        'self_attn.q_norm.weight':  'self_attn.q_norm.weight',
-        'self_attn.k_norm.weight':  'self_attn.k_norm.weight',
-        'linear_attn.in_proj_qkv.weight': 'linear_attn.in_proj_qkv.weight',
-        'linear_attn.in_proj_z.weight':   'linear_attn.in_proj_z.weight',
-        'linear_attn.in_proj_a.weight':   'linear_attn.in_proj_a.weight',
-        'linear_attn.in_proj_b.weight':   'linear_attn.in_proj_b.weight',
-        'linear_attn.conv1d.weight':       'linear_attn.conv1d.weight',
-        'linear_attn.A_log':               'linear_attn.A_log',
-        'linear_attn.dt_bias':             'linear_attn.dt_bias',
-        'linear_attn.norm.weight':         'linear_attn.norm.weight',
-        'linear_attn.out_proj.weight':     'linear_attn.out_proj.weight',
-        'mlp.gate.weight':                    'mlp.gate.weight',
-        'mlp.shared_expert.gate_proj.weight': 'mlp.shared_gate_proj.weight',
-        'mlp.shared_expert.up_proj.weight':   'mlp.shared_up_proj.weight',
-        'mlp.shared_expert.down_proj.weight': 'mlp.shared_down_proj.weight',
-        'mlp.shared_expert_gate.weight':      'mlp.shared_expert_gate.weight',
-        'mlp.experts.gate_up_proj':           'mlp.experts_gate_up',
-        'mlp.experts.down_proj':              'mlp.experts_down',
-    }
-    def translate(hk):
-        if hk.startswith('model.visual.') or hk.startswith('mtp.'): return None
-        k = hk
-        if k.startswith('model.language_model.'): k = k[len('model.language_model.'):]
-        if k == 'lm_head.weight':      return 'lm_head.weight'
-        if k == 'embed_tokens.weight': return 'embed_tokens.weight'
-        if k == 'norm.weight':         return 'norm.weight'
-        m = re.match(r'layers\.(\d+)\.(.*)', k)
-        if not m: return None
-        li, rest = m.group(1), m.group(2)
-        if rest in table: return f'layers.{li}.{table[rest]}'
+def _hf_to_our_key(hk: str) -> str | None:
+    """Strip HF key prefix to match our model's state_dict keys.
+
+    HF stores weights under 'model.*' (text backbone) or at top-level
+    ('lm_head.weight'). Our model mirrors HF naming exactly except we
+    have no 'model.' wrapper — everything lives at the top level.
+    """
+    if hk.startswith('model.visual.') or hk.startswith('mtp.'):
         return None
-    return translate
+    # Multi-modal wrapper used by some checkpoints
+    if hk.startswith('model.language_model.'):
+        hk = hk[len('model.language_model.'):]
+    # Strip the 'model.' prefix that wraps the text backbone in HF
+    if hk.startswith('model.'):
+        hk = hk[len('model.'):]
+    return hk
 
 
-def load_weights(model, weight_dir, verbose=True, device_map=None):
-    """Load HF safetensors weights into model.
-
-    device_map: optional dict mapping model param names to devices.
-                When provided, each tensor is placed directly on its target
-                device instead of going through a full CPU state_dict.
+def load_weights(model, weight_dir, verbose=True):
+    """Load HF safetensors weights directly — no translation table needed.
+    Our attribute names mirror HF exactly; we only strip the 'model.' prefix.
     """
     with open(os.path.join(weight_dir, 'model.safetensors.index.json')) as f:
         wmap = json.load(f)['weight_map']
 
-    shards = {}
-    for k, v in wmap.items(): shards.setdefault(v, []).append(k)
+    shards: dict[str, list[str]] = {}
+    for k, v in wmap.items():
+        shards.setdefault(v, []).append(k)
 
-    translate = _build_translate()
-
-    if device_map is not None:
-        # Direct-to-device loading: set each parameter in-place on its target device.
-        # Avoids holding the full model in CPU RAM when using multi-GPU dispatch.
-        param_dict = dict(model.named_parameters())
-        param_dict.update(dict(model.named_buffers()))
-        mapped = 0
-        mismatches = []
-        for shard_name in sorted(shards):
-            if verbose: print(f'  {shard_name}', flush=True)
-            f = safe_open(os.path.join(weight_dir, shard_name), framework='pt', device='cpu')
-            for hk in shards[shard_name]:
-                mk = translate(hk)
-                if mk is None: continue
-                if mk not in param_dict:
-                    mismatches.append(f'model key missing: {mk}')
-                    continue
-                t = f.get_tensor(hk).to(param_dict[mk].dtype)
-                if t.shape != param_dict[mk].shape:
-                    mismatches.append(f'shape {hk}: hf={t.shape} model={param_dict[mk].shape}')
-                    continue
-                # Find target device from device_map (look up by layer/module prefix)
-                target_dev = None
-                for prefix in sorted(device_map.keys(), key=len, reverse=True):
-                    if mk == prefix or mk.startswith(prefix + '.') or prefix == '':
-                        target_dev = device_map[prefix]
-                        break
-                if target_dev is None:
-                    target_dev = 'cpu'
-                with torch.no_grad():
-                    param_dict[mk].data = t.to(target_dev)
-                mapped += 1
-        if mismatches:
-            print(f'  Issues ({len(mismatches)}):')
-            for m in mismatches[:10]: print(f'    {m}')
-        if verbose: print(f'  Mapped {mapped} tensors.')
-        return model
-
-    # Default: load everything to CPU via state_dict
     sd = model.state_dict()
-    mapped = 0
-    mismatches = []
+    mapped, mismatches = 0, []
+
     for shard_name in sorted(shards):
-        if verbose: print(f'  {shard_name}', flush=True)
         f = safe_open(os.path.join(weight_dir, shard_name), framework='pt', device='cpu')
         for hk in shards[shard_name]:
-            mk = translate(hk)
-            if mk is None: continue
+            mk = _hf_to_our_key(hk)
+            if mk is None:
+                continue
             if mk not in sd:
-                mismatches.append(f'model key missing: {mk}')
+                mismatches.append(f'missing: {hk} → {mk}')
                 continue
             t = f.get_tensor(hk)
             if t.shape != sd[mk].shape:
-                mismatches.append(f'shape {hk}: hf={t.shape} model={sd[mk].shape}')
+                mismatches.append(f'shape mismatch {hk}: hf={t.shape} ours={sd[mk].shape}')
                 continue
             sd[mk] = t.to(sd[mk].dtype)
             mapped += 1
+
     if mismatches:
         print(f'  Issues ({len(mismatches)}):')
-        for m in mismatches[:10]: print(f'    {m}')
-    if verbose: print(f'  Mapped {mapped} tensors.')
+        for m in mismatches[:10]:
+            print(f'    {m}')
+    if verbose:
+        print(f'  Mapped {mapped} tensors.')
     model.load_state_dict(sd, strict=False)
     return model
 
