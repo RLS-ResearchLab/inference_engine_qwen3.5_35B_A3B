@@ -1,0 +1,9 @@
+weights/
+*.safetensors
+*.bin
+__pycache__/
+*.pyc
+*.pyo
+results/
+*.log
+.env
