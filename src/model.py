@@ -58,21 +58,6 @@ class RMSNorm(nn.Module):
         return (x * (1.0 + self.weight.float())).to(dt)
 
 
-class RMSNormStd(nn.Module):
-    """Standard RMSNorm: output = rms_norm(x) * weight.
-    Used for q_norm and k_norm inside FullAttn (weight init=1, not offset).
-    Matches HF Qwen3_5MoeRMSNorm when applied to per-head QK vectors."""
-    def __init__(self, d, eps=EPS):
-        super().__init__()
-        self.eps = eps
-        self.weight = nn.Parameter(torch.ones(d))  # init 1, standard multiply
-
-    def forward(self, x):
-        dt = x.dtype
-        x  = x.float()
-        x  = x * x.pow(2).mean(-1, keepdim=True).add(self.eps).rsqrt()
-        return (x * self.weight.float()).to(dt)
-
 class RMSNormGated(nn.Module):
     """Qwen3_5MoeRMSNormGated: rms_norm then weight*x, then silu(gate) multiply.
     Weight init ~1 (standard multiply, no offset). Exact HF formula:
@@ -116,6 +101,8 @@ def apply_rope(q, k, cos, sin):
     return (torch.cat([qr*c + rot_half(qr)*s, qp], -1),
             torch.cat([kr*c + rot_half(kr)*s, kp], -1))
 
+
+
 # ── Full Attention (GQA + output gate) ──────────────────────────────────────
 class FullAttn(nn.Module):
     def __init__(self):
@@ -125,8 +112,8 @@ class FullAttn(nn.Module):
         self.k_proj = nn.Linear(H, NKV * DH,    bias=False)
         self.v_proj = nn.Linear(H, NKV * DH,    bias=False)
         self.o_proj = nn.Linear(NQ * DH, H,      bias=False)
-        self.q_norm = RMSNormStd(DH)
-        self.k_norm = RMSNormStd(DH)
+        self.q_norm = RMSNorm(DH)
+        self.k_norm = RMSNorm(DH)
 
     def forward(self, x, cos, sin, mask=None, kv=None):
         B, T, _ = x.shape
@@ -257,10 +244,16 @@ class LinearAttn(nn.Module):
 
         # L2-normalize Q and K (use_qk_l2norm_in_kernel=True)
         scale = LHD ** -0.5
-        q = l2norm(q) * scale               # [B,T,32,128] in x.dtype
-        k = l2norm(k)                        # [B,T,32,128] in x.dtype
+        q = l2norm(q.float()) * scale       # [B,T,32,128] float32
+        k = l2norm(k.float())               # [B,T,32,128] float32
 
-        # GDR sequential scan in bf16 — matches HF torch_recurrent_gated_delta_rule:
+        # GDR sequential scan in float32 — matches HF torch_recurrent_gated_delta_rule
+        # exactly (it casts q,k,v,beta,g to float32 before the scan and only casts the
+        # output back to bf16 at the end). Running this in bf16 causes the recurrent
+        # state to accumulate rounding error much faster on repetitive/low-entropy
+        # input (state updates barely change step-to-step, so bf16 quantization noise
+        # doesn't average out) — verified this compounds into degenerate repetition
+        # loops during autoregressive generation, not just a small logit diff.
         #   S = S * g_t                          (decay first)
         #   kv_mem = (S * k_t).sum(dim=-2)       (k_t @ decayed S)
         #   delta = (v_t - kv_mem) * beta_t      (beta on residual)
@@ -268,14 +261,13 @@ class LinearAttn(nn.Module):
         #   y_t = (S * q_t).sum(dim=-2)
         dt = x.dtype
         if state is None:
-            S = torch.zeros(B, LVH, LHD, LHD, device=x.device, dtype=dt)
+            S = torch.zeros(B, LVH, LHD, LHD, device=x.device, dtype=torch.float32)
         else:
-            S = state.to(dt)
+            S = state.float()
 
-        # Cast scan inputs to model dtype
-        g    = g.to(dt)
-        beta = beta.to(dt)
-        v    = v.to(dt)
+        g    = g.float()
+        beta = beta.float()
+        v    = v.float()
 
         ys = []
         for t in range(T):
@@ -303,7 +295,9 @@ class LinearAttn(nn.Module):
 
         new_state = S.detach()
 
-        y = torch.stack(ys, dim=1)      # [B,T,32,128]
+        # Cast back to model dtype here (matches HF: torch_recurrent_gated_delta_rule
+        # casts core_attn_out to initial_dtype before it ever reaches the gated norm).
+        y = torch.stack(ys, dim=1).to(dt)   # [B,T,32,128]
         y = y.reshape(B*T*LVH, LHD)    # flatten for norm: [B*T*32, 128]
         z_flat = z.reshape(B*T*LVH, LHD)
         y = self.norm(y, z_flat)        # RMSNormGated: norm(y) * silu(z), returns x.dtype
@@ -328,7 +322,7 @@ class Experts(nn.Module):
     """Matches HF mlp.experts.{gate_up_proj,down_proj}."""
     def __init__(self):
         super().__init__()
-        self.gate_up_proj = nn.Parameter(torch.empty(NE, 2*MI, H))  # [256,1024,2048]
+        self.gate_up_proj = nn.Parameter(torch.empty(NE, 2*MI, H))  # [256,1024,2048] #TODO: WHY IS IT UNINITIALIZED DATA  (torch.empty)
         self.down_proj    = nn.Parameter(torch.empty(NE, H,    MI))  # [256,2048, 512]
 
 
@@ -405,7 +399,7 @@ class Layer(nn.Module):
         else:
             a, new_s, new_c = self.linear_attn(h, state, conv)
             new_kv = None
-        x = r + a
+        x = r + a #residual
         x = x + self.mlp(self.post_attention_layernorm(x))
         return x, new_kv, new_s, new_c
 
@@ -426,6 +420,8 @@ class Qwen35MoE(nn.Module):
             c, s = build_rope(T + 64, dev)
             self._cos, self._sin = c, s
             self._rope_T = T + 64
+
+
 
     @torch.no_grad()
     def forward(self, ids, kvs=None, states=None, convs=None):
@@ -618,6 +614,7 @@ if __name__ == '__main__':
         with torch.no_grad():
             hl = hf(ids).logits[0, -1].float().cpu()
         del hf; gc.collect(); torch.cuda.empty_cache()
+
 
         cos_sim   = F.cosine_similarity(ml.unsqueeze(0), hl.unsqueeze(0)).item()
         max_diff  = (ml - hl).abs().max().item()
