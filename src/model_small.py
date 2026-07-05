@@ -61,19 +61,6 @@ class RMSNorm(nn.Module):
         return (x * (1.0 + self.weight.float())).to(dt)
 
 
-class RMSNormStd(nn.Module):
-    def __init__(self, d, eps=EPS):
-        super().__init__()
-        self.eps = eps
-        self.weight = nn.Parameter(torch.ones(d))
-
-    def forward(self, x):
-        dt = x.dtype
-        x  = x.float()
-        x  = x * x.pow(2).mean(-1, keepdim=True).add(self.eps).rsqrt()
-        return (x * self.weight.float()).to(dt)
-
-
 class RMSNormGated(nn.Module):
     def __init__(self, d, eps=EPS):
         super().__init__()
@@ -123,8 +110,8 @@ class FullAttn(nn.Module):
         self.k_proj = nn.Linear(H, NKV * DH, bias=False)
         self.v_proj = nn.Linear(H, NKV * DH, bias=False)
         self.o_proj = nn.Linear(NQ * DH, H, bias=False)
-        self.q_norm = RMSNormStd(DH)
-        self.k_norm = RMSNormStd(DH)
+        self.q_norm = RMSNorm(DH)
+        self.k_norm = RMSNorm(DH)
 
     def forward(self, x, cos, sin, mask=None, kv=None):
         B, T, _ = x.shape
@@ -206,18 +193,19 @@ class LinearAttn(nn.Module):
         k = k.repeat_interleave(2, dim=2)
 
         scale = LHD ** -0.5
-        q = l2norm(q) * scale
-        k = l2norm(k)
+        q = l2norm(q.float()) * scale
+        k = l2norm(k.float())
 
+        # GDR scan in float32 (matches model.py / HF torch_recurrent_gated_delta_rule)
         dt = x.dtype
-        g    = g.to(dt)
-        beta = beta.to(dt)
-        v    = v.to(dt)
+        g    = g.float()
+        beta = beta.float()
+        v    = v.float()
 
         if state is None:
-            S = torch.zeros(B, LVH, LHD, LHD, device=x.device, dtype=dt)
+            S = torch.zeros(B, LVH, LHD, LHD, device=x.device, dtype=torch.float32)
         else:
-            S = state.to(dt)
+            S = state.float()
 
         ys = []
         for t in range(T):
@@ -233,7 +221,7 @@ class LinearAttn(nn.Module):
             ys.append((S * q_t.unsqueeze(-1)).sum(dim=-2))
 
         new_state = S.detach()
-        y = torch.stack(ys, dim=1)
+        y = torch.stack(ys, dim=1).to(dt)   # cast back to model dtype before gated norm
         y = y.reshape(B * T * LVH, LHD)
         z_flat = z.reshape(B * T * LVH, LHD)
         y = self.norm(y, z_flat)
